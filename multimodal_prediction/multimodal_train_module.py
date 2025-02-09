@@ -9,6 +9,7 @@ import wandb
 import os
 import argparse
 import matplotlib.pyplot as plt
+import math
 
 from contrastive_dataset import *
 from loss import *
@@ -19,6 +20,7 @@ from loss import *
 # args = parser.parse_args()
 # print(args)
 
+# time-series modality
 class LSTMEncoder(nn.Module):
     def __init__(self, input_dim=28, hidden_dim=256, output_dim=512, num_layers=2, bidirectional=False):
         super().__init__()
@@ -35,6 +37,50 @@ class LSTMEncoder(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(x)
         out = self.fc(lstm_out)
         return out
+
+# # Temporal attention
+# class PositionalEncoding(nn.Module):
+#     """
+#     최대 T length(현재 24hr)을 max_len으로 설정. 
+#     """
+#     def __init__(self, dim_model, dropout_p, max_len):
+#         super().__init__()
+#         self.dropout = nn.Dropout(dropout_p)
+
+#         # Encoding
+#         pos_encoding = torch.zeros(max_len, dim_model)
+#         position_list = torch.arange(0, max_len, dtype=torch.float).view(-1,1)
+#         division_term = torch.exp(torch.arange(0, dim_model, 2).float() * (-math.log(10000.0)) / dim_model)
+
+#         pos_encoding[:, 0::2] = torch.sin(position_list * division_term)
+#         pos_encoding[:, 1::2] = torch.cos(position_list * division_term)
+
+
+#     def forward(self, ):
+
+# class TemporalTransformer(nn.Module):
+#     def __init__(self, dim_model, num_heads, num_layers, dim_feedforward, max_len=24):
+#         super().__init__()
+
+#         # Learnable positional encoding
+#         self.pos_encoding = PositionalEncoding(d_model=d_model)
+
+#         self.transformer = nn.Transformer(
+#             d_model=dim_model,
+#             nhead=num_heads,
+#             num_encoder_layers= ,
+#             num_decoder_layers= ,
+#             dropout= ,
+#         )
+
+#         self.transformer_encoder = 
+
+    # def forward(self, x):
+    #     x = self.pos_encoding(x) # [B, 24, 256]
+    #     x = x.permute(1,0,2) # [24, B, 256]
+    #     out = self.transformer_encoder(x)
+    #     out = out.permute(1,0,2) # [B, 24, 256]
+    #     return out
 
 # ==================== MLP ====================
 # Time-seires modality MLP
@@ -129,6 +175,15 @@ class MultiModalModel(nn.Module):
 
         self.mlp_text = MLP_text(input_dim=768, hidden_dim=512, output_dim=256).to(self.device)
 
+        # ==================== Temporal Attention ====================
+        # self.temporal_transformer = TemporalTransformer(
+        #     d_model=,
+        #     nhead=,
+        #     num_layers=,
+        #     dim_feedforward=,
+        #     max_len=30 # max_len > 24
+        # )
+
         # ==================== Classifier ====================
         # time-series, image, text -> 각각 (B, T, 256)
         # concat -> (B, T, 256*3) -> fusion_fc -> (B, T, 256)
@@ -206,7 +261,7 @@ class MultiModalModel(nn.Module):
                     valid_b_indices.append(b)
             valid_b_indices = torch.tensor(valid_b_indices, device=device)
 
-            if len(valid_txt) >0 :
+            if len(valid_txt) > 0 :
                 inputs = self.tokenizer(
                     valid_txt, padding="max_length", truncation=True, max_length=self.max_length, return_tensors='pt'
                 ).to(device)
@@ -245,14 +300,10 @@ class MultiModalModel(nn.Module):
         cxr_embeddings = F.normalize(cxr_embeddings, p=2, dim=-1)
         text_embeddings = F.normalize(text_embeddings, p=2, dim=-1)
 
-        # Global Average Pooling
-        ts_embeddings = torch.mean(ts_embeddings, dim=1)
-        cxr_embeddings = torch.mean(cxr_embeddings, dim=1)
-        text_embeddings = torch.mean(text_embeddings, dim=1)
+        fusion_input = torch.cat([ts_embeddings, cxr_embeddings, text_embeddings], dim=-1)  # (B, T, 256*3=768)
+        fused_embeddings = self.relu(self.fusion_fc(fusion_input))  # (B, T, 256)
 
-        fusion_input = torch.cat([ts_embeddings, cxr_embeddings, text_embeddings], dim=-1)  # (B, 256*3=768)
-        fused_embeddings = self.relu(self.fusion_fc(fusion_input))  # (B, 256)
-        logits = self.classifier(fused_embeddings) # (B, 3)
+        logits = self.classifier(fused_embeddings) # (B, T, 3)
 
         if return_logits: 
             return fused_embeddings, logits
@@ -277,13 +328,16 @@ def train_multimodal_model(ts_df, img_df, text_df, lambda_ce=0.3, patience=5):
     print("(3) Dataloader 정의 완료.")
 
     model = MultiModalModel().to(device)
-    contrastive_loss_fn = MultiModalSupConLoss(temperature=0.07, base_temperature=0.07)
+    supcon_loss_fn = SupConLoss(temperature=0.07)
     classification_loss_fn = nn.CrossEntropyLoss()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     early_stopper = Earlystopping(patience=patience)
 
-    num_epochs = 10
+    lambda_intra = 1.0
+    lambda_inter = 0.7
+
+    num_epochs = 1
     batch_size = 6
     args = {
         "learning_rate": 1e-4,
@@ -348,47 +402,46 @@ def train_multimodal_model(ts_df, img_df, text_df, lambda_ce=0.3, patience=5):
             # print("len(text_series[0]): ", len(text_series[0]))
 
             fused_embeddings, ts_embeddings, cxr_embeddings, text_embeddings, logits = model(ts_series, img_series, text_series, time_steps)
-            contrastive_loss = contrastive_loss_fn(ts_embeddings, cxr_embeddings, text_embeddings, stay_ids, time_steps, labels)
-            print(f"logits.shape: {logits.shape}")  # logits의 원래 shape 출력
-            print(f"labels.shape: {labels.shape}")  # labels의 원래 shape 출력
+            contrastive_loss = total_contrastive_loss(ts_embeddings, cxr_embeddings, text_embeddings, fused_embeddings, labels, supcon_loss_fn, lambda_inter, lambda_inter)
 
-            logits_2d = logits.reshape(-1, 3)
-            labels_1d = labels.reshape(-1)
+            logits_2d = logits.view(-1, logits.shape[-1])
+            labels_1d = labels.view(-1)
             labels_1d = labels_1d + 1 # -1 -> 0, 0 -> 1, 1 -> 2
 
-            print(f"Reshaped logits.shape: {logits_2d.shape}")  # logits의 원래 shape 출력
-            print(f"Reshaped labels.shape: {labels_1d.shape}")
+            # print(f"Reshaped logits.shape: {logits_2d.shape}")
+            # print(f"Reshaped labels.shape: {labels_1d.shape}")
 
+            # classification_loss = classification_loss_fn
             classification_loss = classification_loss_fn(logits_2d, labels_1d)
             loss = contrastive_loss + lambda_ce * classification_loss
 
             # backpropagation and optimization
             loss.backward()
             optimizer.step()
-
             train_loss += loss.item()
         
         train_avg_loss = train_loss / (len(train_loader)) # 4배로 증강했기 때문에 이와 같이 설정함.
         print(f"[Epoch {epoch}] Train Loss = {train_avg_loss: .4f}")
         # wandb.log({"Train loss": avg_loss.item()})
 
-        print("Validation Process")
-        val_metrics = evaluate_model(model, val_loader, device, classification_loss_fn, save_embeddings=True)
+        print("<Validation Process>")
+        val_metrics = evaluate_model(model, val_loader, device, classification_loss_fn)
         val_loss = val_metrics['loss']
 
         if early_stopper.early_stop(val_loss, model, epoch):
             print(f"Early stopping is triggered. Best Model at Epoch {epoch}")
 
         # tsne visualization
-        if epoch == 1 or epoch % 10 == 0:
+        if epoch == 0 or epoch % 10 == 0:
             print(f"[Epoch {epoch}] tsne 시각화")
             embedding_tsne(val_metrics['embeddings'], val_metrics['labels'], epoch, save_path="tsne/contrastive_space")
 
-    print("Test Process")
-    test_metrics = evaluate_model(model, test_loader, device, classification_loss_fn, save_embeddings=False)
+    print("<Test Process>")
+    test_metrics = evaluate_model(model, test_loader, device, classification_loss_fn)
+    embedding_tsne(test_metrics['embeddings'], test_metrics['labels'], epoch, save_path="tsne/contrastive_space/test")
     return model, train_avg_loss, val_metrics, test_metrics
 
-def evaluate_model(model, dataloader, device, criterion, save_embeddings=False):
+def evaluate_model(model, dataloader, device, criterion):
     """
     val, test dataloader에 대한 평가 진행함.
 
@@ -410,6 +463,8 @@ def evaluate_model(model, dataloader, device, criterion, save_embeddings=False):
     all_labels = []
     all_probs = []
     all_embeddings = [] # for t-SNE
+
+    buffer_min_samples = 24 * 3
 
     with torch.no_grad():
         for batch in dataloader:
@@ -446,13 +501,13 @@ def evaluate_model(model, dataloader, device, criterion, save_embeddings=False):
 
             fused_embeddings, logits = model(ts_series, img_series, text_series, time_steps, return_logits=True)
 
-            logits_2d = logits.reshape(-1, 3)
-            num_classes = logits_2d.shape[1]
+            logits_2d = logits.view(-1, logits.shape[-1])
+            # num_classes = logits_2d.shape[1]
+            # print("num_classes:", num_classes)
 
-            labels_1d = labels.reshape(-1)
+            labels_1d = labels.view(-1)
             labels_1d = labels_1d + 1
 
-            # print(f"Logits.shape: {logits.shape}")
             # print(f"logits_2d.shape: {logits_2d.shape}")
             # print(f"labels_1d.shape: {labels_1d.shape}")
 
@@ -466,31 +521,39 @@ def evaluate_model(model, dataloader, device, criterion, save_embeddings=False):
             probs = torch.softmax(logits_2d, dim=1)
             all_probs.extend(probs.cpu().numpy())
 
-            if save_embeddings: 
-                all_embeddings.append(fused_embeddings.cpu().numpy())
-                embeddings = np.concatenate(all_embeddings, axis=0)
+            all_embeddings.append(fused_embeddings.cpu().numpy())
+            embeddings = np.concatenate(all_embeddings, axis=0)
+
+            # if save_embeddings: 
+            #     all_embeddings.append(fused_embeddings.cpu().numpy())
+            #     embeddings = np.concatenate(all_embeddings, axis=0)
 
     avg_loss = total_loss / len(dataloader)
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
+    # print(all_preds)
+    # print(all_labels)
+    # all_labels가 [B, T] 형태인 경우:
+    all_labels_flat = all_labels.flatten()   # shape: [B*T]
+    # print("all_labels_flat.shape", all_labels_flat.shape)
 
-    auroc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-    auprc = average_precision_score(nn.functional.one_hot(torch.tensor(all_labels), num_classes=num_classes).numpy(), all_probs, average='macro')
-
-    if save_embeddings: 
-        return {
-            'loss': avg_loss,
-            'AUROC': auroc,
-            'AUPRC': auprc,
-            'embeddings': embeddings,
-            'labels': all_labels
-        }
+    if all_labels_flat.shape[0] < buffer_min_samples or np.unique(all_labels_flat).size < 3: 
+        print("Warning: 3개의 클래스가 모두 포함되지 않아 AUROC/AUPRC를 계산할 수 없습니다.")
+        auroc = None
+        auprc = None
+    else: 
+        auroc = roc_auc_score(all_labels_flat, all_probs, multi_class='ovr', average='macro')
+        auprc = average_precision_score(nn.functional.one_hot(torch.tensor(all_labels_flat), num_classes=3).numpy(), all_probs, average='macro')
+    print("AUROC: ", auroc)
+    print("AUPRC: ", auprc)
 
     return {
         'loss': avg_loss,
         'AUROC': auroc,
-        'AUPRC': auprc
+        'AUPRC': auprc,
+        'embeddings': embeddings,
+        'labels': all_labels_flat
     }
 
 class Earlystopping:
@@ -518,14 +581,22 @@ def embedding_tsne(embeddings, labels, epoch, save_path="tsne"):
     n_samples = embeddings[0].shape
     print("n_samples: ", n_samples)
 
+    print("embeddings.shape")
+
+    if embeddings.ndim==3:
+        embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+    
+    print("Flattened embeddings shape:", embeddings.shape)
+
     tsne = TSNE(n_components=2, perplexity=20, random_state=0)
     tsne_result = tsne.fit_transform(embeddings)
 
     tsne_df = pd.DataFrame(tsne_result, columns = ['component 0', 'component 1'])
-    tsne_df['class'] = labels
+    tsne_df['class'] = labels.flatten()
 
     plt.figure(figsize=(12, 12))
 
+    # modality_marker = {0: 'o', 1: '^', 2:'x'}
     colors = ['forestgreen', 'sandybrown', 'tomato']
     class_names = ['Uncertain', 'Negative', 'Positive']
     for idx in range(3): 
@@ -535,8 +606,8 @@ def embedding_tsne(embeddings, labels, epoch, save_path="tsne"):
             subset['component 1'],
             color = colors[idx],
             label = class_names[idx],
-            s = 0.5,
-            alpha = 0.1
+            s = 10,
+            alpha = 0.8
         )
 
     filename = os.path.join(save_path, f"tsne_epoch_{epoch}.png")
